@@ -1,9 +1,3 @@
-# ============================================================
-# 检索工具定义
-# 这里定义 Agent 可以调用的两个工具，并用 @tool 装饰器包装。
-# 注意：每个工具函数的文档字符串(docstring)会作为"工具说明"发送给大模型，
-#      模型正是根据这些说明来决定何时、如何调用工具，所以这里用中文写清楚。
-# ============================================================
 from langchain_core.tools import tool
 import config
 from db.parent_store_manager import ParentStoreManager
@@ -11,11 +5,11 @@ from core.execution_logger import log_error, log_tool_end, log_tool_start
 
 
 class ToolFactory:
-    """工具工厂：把绑定了具体向量库集合的检索函数，打包成 LangChain 工具列表。"""
+    """工具工厂：封装检索工具。"""
 
     def __init__(self, collection):
-        self.collection = collection                      # 向量库集合（用于搜子块）
-        self.parent_store_manager = ParentStoreManager()  # 父块存储（用于取大块）
+        self.collection = collection
+        self.parent_store_manager = ParentStoreManager()
 
     def _search_child_chunks(self, query: str, limit: int = config.DEFAULT_RETRIEVAL_K) -> str:
         """在文档中搜索与用户问题相关的片段（子块）。
@@ -35,13 +29,11 @@ class ToolFactory:
                 k=limit,
                 score_threshold=config.RETRIEVAL_SCORE_THRESHOLD,
             )
-            # if：一个都没搜到 → 返回"没相关内容"的暗号（供 nodes 里过滤掉）
             if not results:
-                output = "NO_RELEVANT_CHUNKS"  # 没搜到相关内容的标记
+                output = "NO_RELEVANT_CHUNKS"
                 log_tool_end("search_child_chunks", output)
                 return output
 
-            # 把每个命中的子块拼成"父块ID + 文件名 + 内容"的文本返回给模型
             output = config.CHILD_CHUNK_SEPARATOR.join([
                 f"Parent ID: {doc.metadata.get('parent_id', '')}\n"
                 f"File Name: {doc.metadata.get('source', '')}\n"
@@ -69,9 +61,8 @@ class ToolFactory:
         log_tool_start("retrieve_parent_chunks", {"parent_id": parent_id})
         try:
             parent = self.parent_store_manager.load_content(parent_id)
-            # if：这个 parent_id 找不到对应父块 → 返回"没这父块"的暗号
             if not parent:
-                output = "NO_PARENT_DOCUMENT"  # 找不到对应父块的标记
+                output = "NO_PARENT_DOCUMENT"
                 log_tool_end("retrieve_parent_chunks", output)
                 return output
 
@@ -90,8 +81,7 @@ class ToolFactory:
             return output
 
     def create_tools(self) -> list:
-        """把上面两个函数包装成 LangChain 工具并返回列表。"""
+        """把检索函数包装成 LangChain 工具列表。"""
         search_tool = tool("search_child_chunks")(self._search_child_chunks)
         retrieve_tool = tool("retrieve_parent_chunks")(self._retrieve_parent_chunks)
-
         return [search_tool, retrieve_tool]
