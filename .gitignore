@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 qdrant_db/
 parent_store/
+markdown_docs/
