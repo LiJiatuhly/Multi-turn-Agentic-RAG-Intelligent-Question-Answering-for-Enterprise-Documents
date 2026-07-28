@@ -1,4 +1,38 @@
+# 提示词仓库：把每个节点要发给大模型的"系统提示(system prompt)"集中放在这里。
+#
+# ┌─ 这个文件在整个项目里扮演什么角色？ ──────────────────────────────
+# │ nodes.py 里的每个"要调用大模型"的节点，都不会把提示词写死在自己身上，
+# │ 而是来这里调一个 get_xxx_prompt() 函数拿现成的提示词字符串。
+# │ 好处：提示词和流程逻辑分开 —— 改措辞只动这一个文件，不碰 nodes.py。
+# │
+# │ 每个函数都只做一件事：return 一段多行字符串（就是提示词本身）。
+# │ 没有任何逻辑、没有参数、不读状态。它们就是"贴在墙上的岗位说明书"。
+# └──────────────────────────────────────────────────────────────────
+#
+# ★ 提示词 → 使用它的节点 → 期望模型返回什么（一览表）★
+#   get_conversation_summary_prompt → summarize_history(主图)   → 一段摘要文本
+#   get_rewrite_query_prompt        → rewrite_query(主图)       → 一个 JSON(见 schemas.QueryAnalysis)
+#   get_orchestrator_prompt         → orchestrator(子图)        → 答案文本 或 工具调用
+#   get_fallback_response_prompt    → fallback_response(子图)   → 兜底答案文本
+#   get_context_compression_prompt  → compress_context(子图)    → 结构化 Markdown 摘要
+#   get_aggregation_prompt          → aggregate_answers(主图)   → 最终合并答案文本
+# （"主图/子图"指 graph.py 里的两张图；具体每个节点怎么用见下方各函数注释。）
+
+
+# ============================================================
+# 🅱️ get_conversation_summary_prompt —— 给 summarize_history 节点用
+# ============================================================
 def get_conversation_summary_prompt() -> str:
+    """记忆管理器提示词：把"旧摘要 + 即将删除的老消息"压成一份新摘要。
+
+    ── 谁用它、怎么流转 ──────────────────────────────────────────────
+    使用者：nodes.py 的 summarize_history（主图第一个干活的节点，每轮对话开头跑）。
+    输入给模型的材料：State.conversation_summary（已有的滚动摘要）+ 一批较早的消息。
+    模型吐出的东西：一段【纯摘要文本】(30~70 字)。
+    去向：写回 State.conversation_summary；随后这批老消息会被 RemoveMessage 删掉，
+          省下的位置由这段摘要"代表"。下一步 rewrite_query 会读这份摘要当上下文。
+    为什么需要它：对话越滚越长会撑爆上下文窗口，所以"删老消息、留浓缩摘要"。
+    """
     return """## 角色
 你是一个检索增强对话助手的"记忆管理器"，负责把历史对话压缩成简短摘要。
 
@@ -19,7 +53,34 @@ def get_conversation_summary_prompt() -> str:
 如果没有任何有意义的上下文，返回空字符串。
 """
 
+
+# ============================================================
+# 🅱️ get_rewrite_query_prompt —— 给 rewrite_query 节点用（澄清机制的大脑）
+# ============================================================
 def get_rewrite_query_prompt() -> str:
+    """查询改写提示词：把用户问题改成适合检索的形式，并判断"清不清晰"。
+
+    ── 谁用它、怎么流转（这是全流程最关键的分叉点之一）──────────────────
+    使用者：nodes.py 的 rewrite_query（主图第二个节点）。
+    它不是普通调用，而是配合 with_structured_output(QueryAnalysis, method="json_mode")
+    使用——见 schemas.py。所以这段提示词【最后的"输出格式"部分要求返回 JSON】，
+    模型返回的 JSON 会被自动解析成 QueryAnalysis 对象（含三个字段）。
+
+    模型返回的三个字段各自的下游去向：
+      is_clear            → 写入 State.questionIsClear
+      questions           → 写入 State.rewrittenQuestions（改写后的 1~3 个子问题）
+      clarification_needed→ 问题不清晰时，用来生成"要用户补充什么"的提示
+
+    紧接着 edges.py 的 route_after_rewrite 会读 questionIsClear 决定分叉：
+      True  → 遍历 rewrittenQuestions，给每个子问题发一个 Send，并行启动 Agent 子图
+      False → 去 request_clarification（图会在此之前 interrupt 暂停，等用户补充）
+
+    ── 提示词里"判断是否清晰"那几行为什么这么重要 ────────────────────────
+    它直接决定"要不要打断用户去追问"。规则被写得很保守：
+      · 只有当问题依赖未解决的指代（"它/那个/这个文件"）时才判为不清晰；
+      · 遇到没见过的新术语/缩写，不许当成打错字去追问，直接原样检索。
+    这样既避免了"什么都不问就乱答"，也避免了"动不动就打断用户"。
+    """
     return """## 角色
 你是 RAG 系统里负责"查询改写"的专家，目标是把用户问题改写得适合用于文档检索。
 
@@ -54,7 +115,32 @@ def get_rewrite_query_prompt() -> str:
 {"is_clear": false, "questions": [], "clarification_needed": "你说的『它』具体指哪个系统？"}
 """
 
+
+# ============================================================
+# 🅱️ get_orchestrator_prompt —— 给 orchestrator 节点用（Agent 循环的主控)
+# ============================================================
 def get_orchestrator_prompt() -> str:
+    """编排模型提示词：驱动"检索→判断→再检索/作答"这个 Agent 循环。
+
+    ── 谁用它、怎么流转 ──────────────────────────────────────────────
+    使用者：nodes.py 的 orchestrator（Agent 子图的核心，每圈循环都会跑）。
+    它用的模型是 llm_with_tools（graph.py 里 llm.bind_tools(...) 绑好的），
+    因此模型每次回复有两种可能，正好对应 edges.py route_after_orchestrator_call 的分叉：
+      · 回复里带 tool_calls（要调 tools.py 的 search_child_chunks / retrieve_parent_chunks）
+        → 去 tools 节点真正执行 → 继续循环
+      · 回复里没有 tool_calls（模型认为证据够了，直接给答案）
+        → 去 collect_answer 收尾
+
+    ── 提示词里几条"防重复检索"的规则和状态字段的呼应关系 ─────────────────
+    "不要重复压缩上下文里已列出的搜索词或父块 ID" 这句，靠的是：
+      should_compress_context 把搜过的词/父块记进 AgentState.retrieval_keys，
+      compress_context 再把它们写进 context_summary 末尾的"已执行清单"，
+      这段清单会作为背景喂回给本模型 → 模型据此避免重复搜。三者配合才生效。
+
+    ── "参考来源"格式为什么写得这么死 ──────────────────────────────────
+    因为下游 aggregate_answers 汇总多个 Agent 答案时要靠这个固定格式识别来源文件名；
+    格式一乱，汇总就抓不准来源。所以这里强制"每个文件名单独一行、短横线列表"。
+    """
     return """## 角色
 你是一个基于文档的检索型研究助手（Agentic RAG）。你的任务是依据检索到的文档证据来回答，而不是依赖你自己的常识或通用知识。
 
@@ -91,7 +177,25 @@ def get_orchestrator_prompt() -> str:
 - 去掉文件名后面的描述性文字（包括括号里的内容）。
 """
 
+
+# ============================================================
+# 🅱️ get_fallback_response_prompt —— 给 fallback_response 节点用（预算耗尽的兜底)
+# ============================================================
 def get_fallback_response_prompt() -> str:
+    """兜底整合器提示词：研究循环到上限了，用手头材料给出尽量好的答案。
+
+    ── 谁用它、什么时候才会触发 ──────────────────────────────────────
+    使用者：nodes.py 的 fallback_response（Agent 子图的"急刹车出口"）。
+    触发路径：edges.py route_after_orchestrator_call 发现
+              iteration_count >= MAX_ITERATIONS 或 tool_call_count > MAX_TOOL_CALLS
+              （预算用完）→ 不再执行新工具，改走这里。
+    输入材料：AgentState.context_summary（压缩研究上下文）+ 当前工具输出（检索数据）。
+    产出去向：把兜底答案写进 messages，随后固定流向 collect_answer 收尾。
+
+    ── 一条容易忽略但关键的规则 ──────────────────────────────────────
+    "如果二者冲突，优先采用当前的检索数据，而不是压缩上下文"——因为压缩是有损的，
+    最新一手的检索数据比被压过的旧摘要更可信。
+    """
     return """## 角色
 你是一个受约束的证据整合器：研究循环已经到达上限，你需要用现有材料给出尽可能好的回答。
 
@@ -117,7 +221,27 @@ def get_fallback_response_prompt() -> str:
 - 不要臆造或推断来源文件名。
 """
 
+
+# ============================================================
+# 🅱️ get_context_compression_prompt —— 给 compress_context 节点用（腾 token)
+# ============================================================
 def get_context_compression_prompt() -> str:
+    """研究上下文压缩器提示词：把冗长的检索原文压成结构化 Markdown 摘要。
+
+    ── 谁用它、什么时候触发、产物给谁 ────────────────────────────────
+    使用者：nodes.py 的 compress_context（Agent 子图内部）。
+    触发路径：should_compress_context 估算 token，发现子图消息太长 →
+              返回 Command(goto="compress_context")，才会进到这里。
+    产物：一段结构化 Markdown（# 研究上下文摘要 / ## 聚焦 / ## 结构化发现 / ## 缺口）。
+    去向：写入 AgentState.context_summary；同时 compress_context 会把
+          retrieval_keys（已搜词/已取父块）拼到摘要末尾当"已执行清单"。
+          压缩完把除首条外的旧消息删掉，然后回到 orchestrator 继续检索——
+          此时 orchestrator 看到的就是这段浓缩摘要，而不是一大堆原文。
+
+    ── "按来源文件组织，标题必须用真实文件名"这条为什么重要 ─────────────────
+    因为最终 aggregate_answers 要靠文件名给出"参考来源"。压缩阶段就把发现
+    按真实文件名归类，能保证来源信息一路不丢、不被编造。
+    """
     return """## 角色
 你是 Agentic RAG 系统里的"研究上下文压缩器"。
 
@@ -144,7 +268,26 @@ def get_context_compression_prompt() -> str:
 - 缺失或不完整的方面
 """
 
+
+# ============================================================
+# 🅱️ get_aggregation_prompt —— 给 aggregate_answers 节点用（多路答案合一)
+# ============================================================
 def get_aggregation_prompt() -> str:
+    """最终答案整合器提示词：把 N 个并行 Agent 各自的答案合成一份回复。
+
+    ── 谁用它、材料从哪来、结果去哪 ──────────────────────────────────
+    使用者：nodes.py 的 aggregate_answers（主图最后一个节点，fan-in 汇合点）。
+    材料来源：State.agent_answers —— 这里累积了所有并行子图 collect_answer 冒泡上来的
+              答案条目（每条含 index/answer/contexts）。aggregate_answers 会先按
+              index 排序，再连同 State.originalQuery（用户最初问的）一起发给模型。
+    结果去向：模型合并出的最终答案，作为 AIMessage 追加进 State.messages —— 这才是
+              用户真正看到的那句回复。
+
+    ── 为什么强调"只用检索到的答案里的信息"、冲突要如实指出 ─────────────────
+    因为整个系统的定位是"基于文档证据"的 RAG，不允许模型自由发挥补内容；
+    若两个子问题的答案互相矛盾，宁可如实说冲突，也不要替用户"和稀泥"编一个统一说法。
+    最后那句"找不到就直说"是兜底：宁可承认查不到，也不编造。
+    """
     return """## 角色
 你是检索增强助手的"最终答案整合器"。
 

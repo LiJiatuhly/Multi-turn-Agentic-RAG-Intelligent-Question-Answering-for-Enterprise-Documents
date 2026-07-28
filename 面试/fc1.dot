@@ -1,0 +1,48 @@
+digraph Main {
+  rankdir=TB;
+  bgcolor="transparent";
+  nodesep=0.40;
+  ranksep=0.46;
+  node [shape=box, style="rounded,filled", fontname="Noto Sans CJK SC",
+        fontsize=11, color="#2C5A8C", fillcolor="#EAF1F8", fontcolor="#16324F",
+        penwidth=1.3, margin="0.14,0.08"];
+  edge [fontname="Noto Sans CJK SC", fontsize=9.5, color="#5C6B7A",
+        fontcolor="#33526E", penwidth=1.3, arrowsize=0.85];
+
+  start  [label="START", shape=oval, fillcolor="#2C5A8C", fontcolor="white", color="#22496F", fontsize=11];
+  sh     [label=<<b>summarize_history</b><br/><font point-size="8.5" color="#5B6B7A">多轮记忆 · 滚动摘要 · 清空上轮答案</font>>];
+  rw     [label=<<b>rewrite_query</b><br/><font point-size="8.5" color="#5B6B7A">判断清晰度 · 拆成 1~3 个自包含子问题</font>>];
+  dec    [label=<<b>问题清晰?</b><br/><font point-size="8.5" color="#8A6A22">route_after_rewrite</font>>,
+          shape=diamond, fillcolor="#FCF1DA", color="#C79322", fontcolor="#7A5B15", margin="0.02,0.02"];
+  clar   [label=<<b>request_clarification</b><br/><font point-size="8.5" color="#8A5A2A">interrupt 暂停 · 等用户补充</font>>,
+          fillcolor="#FBEEE3", color="#C77A3C", fontcolor="#7A4A22"];
+  a1     [label=<<b>Agent 子图 ①</b><br/><font point-size="8.5" color="#3F7A57">子问题 0 · 独立 AgentState</font>>,
+          fillcolor="#E8F3EC", color="#2E7D52", fontcolor="#1E5638"];
+  a2     [label=<<b>Agent 子图 ②</b><br/><font point-size="8.5" color="#3F7A57">子问题 1 · 互不干扰</font>>,
+          fillcolor="#E8F3EC", color="#2E7D52", fontcolor="#1E5638"];
+  a3     [label=<<b>Agent 子图 ③</b><br/><font point-size="8.5" color="#3F7A57">子问题 2 · 各自检索</font>>,
+          fillcolor="#E8F3EC", color="#2E7D52", fontcolor="#1E5638"];
+  agg    [label=<<b>aggregate_answers</b><br/><font point-size="8.5" color="#5B6B7A">按 index 排序 · 缝合成一段连贯回复</font>>];
+  end    [label="END", shape=oval, fillcolor="#2C5A8C", fontcolor="white", color="#22496F", fontsize=11];
+
+  start -> sh;
+  sh -> rw;
+  rw -> dec;
+
+  // 否分支走左侧，回到 rewrite_query（左通道，独立不交叉）
+  dec -> clar [label="否", fontcolor="#B5651D"];
+  clar -> rw  [label="补充后重新改写", fontcolor="#B5651D", constraint=false];
+
+  // 是分支：Send 并行扇出到三个子图
+  dec -> a1;
+  dec -> a2 [label="是 · Send Fan-out", fontcolor="#2E7D52"];
+  dec -> a3;
+  { rank=same; a1; a2; a3; }
+
+  // 扇入汇总
+  a1 -> agg;
+  a2 -> agg [label="全部完成 · Fan-in", fontcolor="#2E7D52"];
+  a3 -> agg;
+
+  agg -> end;
+}
