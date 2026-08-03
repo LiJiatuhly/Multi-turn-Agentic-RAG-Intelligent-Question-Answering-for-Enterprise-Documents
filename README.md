@@ -1,243 +1,192 @@
+<div align="center">
+
 # 多轮 Agentic RAG 企业文档智能问答系统
 
-完整的项目结构、运行步骤、源码职责和 Ragas 评测流程见 [RAG_SYSTEM_GUIDE.md](./RAG_SYSTEM_GUIDE.md)。
+一个面向学习和作品集展示的 Agentic RAG 项目：用 LangGraph 手写主图与 Agent 子图，完成问题改写、并行检索、上下文管理、答案生成和 Ragas 评测。
 
-基于 **LangGraph** 手写「主图 + Agent 子图」双层状态图的多轮 Agentic RAG 系统。模型自主决定检索轮次与检索粒度，支持复合问题并行拆解、澄清追问、上下文压缩与预算护栏。
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-Agentic%20Workflow-1C3C3C)](https://langchain-ai.github.io/langgraph/)
+[![Ragas](https://img.shields.io/badge/Ragas-Evaluation-6B46C1)](https://docs.ragas.io/)
+[![GitHub](https://img.shields.io/badge/Code-GitHub-181717?logo=github&logoColor=white)](https://github.com/LiJiatuhly/Multi-turn-Agentic-RAG-Intelligent-Question-Answering-for-Enterprise-Documents)
 
-> 不依赖 `create_react_agent` 等 prebuilt 封装，两张图完全手写，便于精细控制 Agent 的检索循环、上下文工程与容错逻辑。
+</div>
 
----
+## 项目简介
 
-## ✨ 核心特性
+这个项目用于理解一个 Agentic RAG 的完整链路，而不是把所有功能封装成黑盒：
 
-| 特性 | 说明 |
-| --- | --- |
-| **双层状态图** | 主图管多轮记忆、问题改写与并行分发；Agent 子图实现单个子问题的 ReAct 检索循环 |
-| **并行子问题** | 用 `Send` 将改写后的 1~3 个子问题 Fan-out 成独立子图并行检索，Fan-in 汇总合成最终回答 |
-| **混合检索** | Qdrant 稠密向量 + FastEmbed BM25 稀疏向量双路召回，HYBRID 模式经 RRF 排序融合 |
-| **父子分块** | 子块入向量库保证匹配精度，父块独立存储；命中后按 `parent_id` 二次回取完整父块补全上下文 |
-| **上下文工程** | 对话侧滚动摘要 + Agent 侧动态 token 阈值压缩，回注「已搜清单」抑制重复检索 |
-| **预算护栏** | 迭代轮数与工具调用次数双上限，超限切入 fallback 节点用已有材料强制作答 |
-| **澄清追问** | `interrupt` 实现 Human-in-the-loop，问题不清晰时暂停反问，多轮补充累积后合并重写 |
-| **结构化输出** | Pydantic + json_mode，挂三重 `field_validator` 容错校验器，兼容模型不规范输出 |
-| **评测就绪** | 检索原文块随答案回传，接入 RAGAS 评测（Faithfulness / ContextRecall / ResponseRelevancy） |
+```text
+用户问题 → 问题改写 → 子问题并行分发 → 混合检索 → reranker 精排
+        → 父块回取 → Agent 判断是否继续检索 → 汇总回答 → Ragas 评测
+```
 
----
+系统基于智谱 OpenAI 兼容接口，使用 Gradio 提供交互界面。完整的源码职责、运行顺序和评测解释见 [RAG_SYSTEM_GUIDE.md](./RAG_SYSTEM_GUIDE.md)。
 
-## 🧱 技术栈
+## 核心能力
 
-**LangGraph** · **LangChain** · **Qdrant**（稠密+稀疏混合检索）· **FastEmbed BM25** · **智谱 GLM / Embedding-3** · **Pydantic** · **RAGAS** · **Gradio**
+| 模块 | 实现 | 解决的问题 |
+| --- | --- | --- |
+| 双层状态图 | LangGraph 主图 + Agent 子图 | 分离多轮对话管理和单个子问题的检索循环 |
+| 并行子问题 | `Send` Fan-out / Fan-in | 复合问题拆解后并行处理，再合成最终回答 |
+| 混合召回 | Qdrant 稠密向量 + FastEmbed BM25 + RRF | 同时利用语义匹配和关键词匹配 |
+| 二阶段检索 | Cross-Encoder reranker | 从召回候选中重新选择最相关的文本块 |
+| 父子分块 | 子块检索 + `parent_id` 回取父块 | 兼顾匹配精度和回答上下文完整性 |
+| Agent 护栏 | 迭代次数、工具调用次数、fallback | 防止无效循环和无上下文回答 |
+| 可解释评测 | Ragas + Agent 行为轨迹 | 同时评价回答质量、检索质量和 Agent 行为 |
 
----
-
-## 🗺️ 架构与数据流
-
-> 三张图用 Mermaid 绘制，GitHub 原生支持渲染。箭头文字标注了该步写入/传递的关键状态字段。
-
-### 1. 主图（外层）—— 多轮对话 · 改写 · 并行分发 · 汇总
+## 架构概览
 
 ```mermaid
-flowchart TD
-    ST(["START"]):::seio
-    SH("<b>summarize_history</b><br/>删旧消息 · 更新滚动摘要"):::proc
-    RW("<b>rewrite_query</b><br/>改写子问题 · 判断清晰度"):::proc
-    RT("<b>route_after_rewrite</b><br/>读 questionIsClear"):::route
-    RC("<b>request_clarification</b><br/>暂停 · 等用户补充"):::seio
-    AG("<b>agent ×N（并行）</b><br/>Send 派发 · 各自独立"):::tool
-    AA("<b>aggregate_answers</b><br/>按 index 合并 → 最终回复"):::proc
-    EN(["END"]):::seio
-
-    ST --> SH
-    SH -->|"写 conversation_summary<br/>agent_answers 发 __reset__ 清空"| RW
-    RW -->|"写 questionIsClear<br/>rewrittenQuestions、originalQuery"| RT
-    RT -->|"不清晰"| RC
-    RC -.->|"interrupt 暂停 · 补充后再进入"| RW
-    RT -->|"清晰 · Send 传 question、question_index"| AG
-    AG -->|"agent_answers 冒泡 · 追加不覆盖"| AA
-    AA -->|"写 messages · 最终回复"| EN
-
-    subgraph LG["图例"]
-        direction LR
-        L1["处理节点"]:::proc
-        L2["路由判断"]:::route
-        L3["并行子图"]:::tool
-        L4["起止 / 暂停"]:::seio
-    end
-
-    classDef proc fill:#eff6ff,stroke:#3b82f6,stroke-width:2px,color:#1e40af
-    classDef route fill:#fffbeb,stroke:#f59e0b,stroke-width:2px,color:#b45309
-    classDef tool fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#047857
-    classDef seio fill:#f9fafb,stroke:#9ca3af,stroke-width:2px,color:#374151
+flowchart LR
+    Q[用户问题] --> M[主图]
+    M --> R[改写问题]
+    R --> A1[Agent 子图 1]
+    R --> A2[Agent 子图 2]
+    R --> AN[Agent 子图 N]
+    A1 --> S[混合召回]
+    A2 --> S
+    AN --> S
+    S --> RR[Cross-Encoder 精排]
+    RR --> P[父块回取]
+    P --> D{继续检索?}
+    D -->|是| S
+    D -->|否| F[子问题答案]
+    F --> G[汇总最终回答]
 ```
 
-### 2. Agent 子图（内层）—— 单个子问题的「检索 → 判断 → 再检索 / 作答」循环
+### 检索链路
 
-```mermaid
-flowchart TD
-    ST(["START"]):::seio
-    OR("<b>orchestrator</b><br/>调模型 · 迭代 +1"):::proc
-    RT("<b>route · 3 选 1</b><br/>读计数 · 读 tool_calls"):::route
-    TL("<b>tools（ToolNode）</b><br/>执行检索工具"):::tool
-    SC("<b>should_compress</b><br/>估 token · Command 分叉"):::route
-    CC("<b>compress_context</b><br/>写 context_summary"):::proc
-    CA("<b>collect_answer</b><br/>写 agent_answers"):::collect
-    FB("<b>fallback_response</b><br/>预算耗尽 · 兜底"):::seio
-    EN(["END"]):::seio
-
-    ST --> OR
-    OR -->|"写 messages · iteration_count +1 · tool_call_count +N"| RT
-    RT -->|"有工具 · 预算足"| TL
-    RT -->|"无工具 · 答完"| CA
-    RT -->|"超上限"| FB
-    TL -->|"写 ToolMessage 到 messages"| SC
-    SC -->|"token 高 → 压缩<br/>写 retrieval_keys、retrieved_contexts"| CC
-    SC -.->|"token 正常 · Command goto<br/>写 retrieval_keys、retrieved_contexts"| OR
-    CC -->|"删除除首条外消息"| OR
-    FB -->|"写 messages · 兜底答案"| CA
-    CA -->|"agent_answers 冒泡到主图"| EN
-
-    subgraph LG["图例"]
-        direction LR
-        L1["处理"]:::proc
-        L2["判断分叉"]:::route
-        L3["工具执行"]:::tool
-        L4["收尾"]:::collect
-        L5["起止 / 兜底"]:::seio
-    end
-
-    classDef proc fill:#eff6ff,stroke:#3b82f6,stroke-width:2px,color:#1e40af
-    classDef route fill:#fffbeb,stroke:#f59e0b,stroke-width:2px,color:#b45309
-    classDef tool fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#047857
-    classDef collect fill:#faf5ff,stroke:#a855f7,stroke-width:2px,color:#7e22ce
-    classDef seio fill:#f9fafb,stroke:#9ca3af,stroke-width:2px,color:#374151
+```text
+问题
+  → Qdrant 召回最多 20 个候选子块
+  → RRF 融合稠密向量和 BM25 结果
+  → jinaai/jina-reranker-v2-base-multilingual 精排
+  → 保留 top 7 子块
+  → 根据 parent_id 回取完整父块
+  → Agent 基于上下文判断和作答
 ```
 
-> ⚠️ `should_compress` 在 `nodes.py` 里返回的是 `Command(goto=…)`，去向写在节点内部，所以 `graph.py` 里查不到它的出边——上图两条出边（实线去 `compress_context`、虚线回 `orchestrator`）正是这个 `Command` 分叉。
+## 快速开始
 
-### 3. 文件依赖关系 —— `graph_state` 是所有节点读写的公共数据总线
+### 1. 安装项目依赖
 
-```mermaid
-flowchart TD
-    G("<b>graph</b><br/>装配 · 编译两张图"):::asm
-    N("<b>nodes</b><br/>所有节点的逻辑"):::logic
-    E("<b>edges</b><br/>条件边 · 路由决策"):::logic
-    P("<b>prompts</b><br/>系统提示词"):::res
-    S("<b>schemas</b><br/>JSON 输出结构"):::res
-    T("<b>tools</b><br/>2 个检索工具"):::res
-    GS("<b>graph_state</b><br/>State · AgentState · 3 个 reducer<br/>（所有节点读写状态的公共数据总线）"):::res
-
-    G --> N
-    G --> E
-    N --> P
-    N --> S
-    N --> T
-    N --> GS
-    E --> GS
-    G --> GS
-
-    subgraph LG["图例"]
-        direction LR
-        L1["装配层"]:::asm
-        L2["逻辑层"]:::logic
-        L3["状态与资源层"]:::res
-    end
-
-    classDef asm fill:#f9fafb,stroke:#9ca3af,stroke-width:2px,color:#374151
-    classDef logic fill:#faf5ff,stroke:#8b5cf6,stroke-width:2px,color:#6d28d9
-    classDef res fill:#ecfdf5,stroke:#10b981,stroke-width:2px,color:#047857
-```
-
-> 完整的字段级读写对照（谁写 → 谁读 → 用什么 reducer 合并）见 [`数据流转对照表.md`](./数据流转对照表.md)。
-
----
-
-## 📂 项目结构
-
-```
-agentic-rag-cn/
-├── project/                  # 核心代码（详见 RAG_SYSTEM_GUIDE.md）
-├── markdown_docs/            # Markdown 语料
-├── parent_store/             # 父块运行数据
-├── qdrant_db/                # 本地 Qdrant 运行数据
-├── evaluation/               # Ragas 评测脚本
-├── RAG_SYSTEM_GUIDE.md       # 完整运行和源码说明书
-├── requirements.txt          # 项目依赖
-└── LICENSE                   # MIT
-```
-
----
-
-## 🚀 快速开始
-
-### 1. 安装依赖
-
-```bash
-git clone https://github.com/LiJiatuhly/agentic-rag-cn.git
-cd agentic-rag-cn
+```powershell
+git clone https://github.com/LiJiatuhly/Multi-turn-Agentic-RAG-Intelligent-Question-Answering-for-Enterprise-Documents.git
+cd Multi-turn-Agentic-RAG-Intelligent-Question-Answering-for-Enterprise-Documents
+python -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量
+### 2. 配置模型
 
-在项目根目录创建 `.env`（或按 `config.py` 的约定配置）：
+复制配置模板：
 
-```bash
-API_KEY=你的智谱API Key
+```powershell
+Copy-Item project\.env.example project\.env
+```
+
+然后编辑 `project/.env`，至少填写：
+
+```env
+API_KEY=你的智谱APIKey
 BASE_URL=https://open.bigmodel.cn/api/paas/v4/
-MODEL_ID=glm-4.7
+MODEL_ID=glm-4.5-air
 ```
 
-### 3. 文档入库
+不要把 `project/.env` 提交到 GitHub。
 
-将待检索的 PDF / Markdown 放入 `markdown_docs/`，运行入库脚本，将文档切分为父子块并写入 Qdrant。
+### 3. 准备文档并启动
 
-### 4. 启动问答
+将自己的 Markdown 文档放入 `markdown_docs/`，然后运行：
 
-启动 Gradio 界面后，在浏览器打开 `http://127.0.0.1:7860` 开始多轮问答。
-
-> 详细运行步骤、源码职责和评测流程见 [`RAG_SYSTEM_GUIDE.md`](./RAG_SYSTEM_GUIDE.md)。
-
----
-
-## 🔍 检索设计：两阶段 + 混合
-
-```
-用户问题
-  → search_child_chunks：稠密 + BM25 双路召回候选子块，RRF 融合，阈值过滤
-  → jina multilingual cross-encoder：对候选子块按“问题-原文”相关性重排
-  → 保留 top-k 子块，命中结果带 parent_id
-  → retrieve_parent_chunks：按 parent_id 回取完整父块，补全上下文
-  → 模型基于父块作答
+```powershell
+python project\app.py
 ```
 
-- **子块**：小片段，入 Qdrant，保证向量匹配精度
-- **父块**：大段原文，独立存储，避免大文本挤占向量库
-- **混合检索**：稠密向量抓语义相似、BM25 抓关键词精确匹配，RRF 融合两路排名
-- **二阶段检索**：先用向量库召回 20 个候选，再用 reranker 精排后交给 Agent，最终仍只返回 7 个子块
+打开终端提示的 Gradio 地址，开始提问。首次运行会建立本地 Qdrant 集合，并按需下载 reranker 模型。
 
----
+## Ragas 评测
 
-## 🧠 上下文工程
+评测分为两个环境：项目环境负责生成真实回答，独立评测环境负责调用 Ragas 裁判模型。
 
-系统对「对话记忆」与「检索记忆」分层管理：
+```powershell
+# 创建评测环境
+python -m venv .venv-eval
+.\.venv-eval\Scripts\Activate.ps1
+pip install -r evaluation\requirements-eval.txt
+```
 
-| 层级 | 机制 |
-| --- | --- |
-| **对话侧**（主图） | 滚动摘要：保留最近 N 轮真实对话，更早消息压缩进 `conversation_summary` 后物理删除 |
-| **Agent 侧**（子图） | 动态阈值压缩：以「基础阈值 + 摘要长度 × 增长因子」为动态上限估算 token，超限则把检索历史压成摘要，并在摘要末尾附加「已搜关键词 / 已取父块 ID」清单回注模型，抑制重复检索 |
-| **预算护栏** | 迭代轮数（`MAX_ITERATIONS`）与工具调用次数（`MAX_TOOL_CALLS`）双上限，任一超限即切入 fallback 节点用已有材料强制作答 |
+评测顺序：
 
----
+```powershell
+# 1. 生成候选测试集（可先用 --size 5）
+python evaluation\gen_testset.py --size 10
 
-## 📊 评测
+# 2. 打开 CSV，人工填写“保留”列为 是/否
+code evaluation\artifacts\testset_preview.csv
 
-检索链路中的原文块经去重后随答案回传，作为 RAGAS 评测的 `contexts` 输入：
+# 3. 生成正式测试集
+python evaluation\curate_testset.py
 
-- **检索侧**：ContextRecall —— 评估召回完整性
-- **生成侧**：Faithfulness / ResponseRelevancy —— 评估答案对检索内容的忠实度与相关性
+# 4. 切回项目环境，调用真实 Agent
+deactivate
+.\venv\Scripts\Activate.ps1
+python evaluation\run_rag.py --limit 1
+python evaluation\run_rag.py
 
----
+# 5. 切回评测环境，评价最终回答
+deactivate
+.\.venv-eval\Scripts\Activate.ps1
+python evaluation\score.py --scope turn
+```
 
-## 📄 License
+整轮级评测固定使用四个指标：
 
-[MIT](./LICENSE)
+- `faithfulness`：回答是否忠于检索原文
+- `answer_relevancy`：回答是否真正针对问题
+- `context_recall`：回答所需信息是否被检索回来
+- `context_precision`：有用的检索内容是否排在前面
+
+结果位于 `evaluation/artifacts/`，该目录默认被 Git 忽略。`runs.jsonl` 是机器读取格式；人类检查真实回答请打开 `runs_preview.md`。
+
+## 代码导航
+
+```text
+project/core/rag_system.py       RAG 系统入口
+project/rag_agent/graph.py       装配并编译主图、Agent 子图
+project/rag_agent/nodes.py       节点逻辑：改写、检索、压缩、回答
+project/rag_agent/tools.py       检索工具和 reranker 接入点
+project/rag_agent/reranker.py    Cross-Encoder 二阶段排序
+project/rag_agent/graph_state.py 状态结构和 reducer
+evaluation/gen_testset.py       Ragas 知识图谱和测试集生成
+evaluation/run_rag.py           调用真实 RAG 并保存运行轨迹
+evaluation/score.py              将真实回答交给 Ragas 评分
+```
+
+推荐阅读顺序：
+
+```text
+RAG_SYSTEM_GUIDE.md
+→ evaluation/README_评测说明.md
+→ project/core/rag_system.py
+→ project/rag_agent/graph.py
+→ project/rag_agent/nodes.py
+→ project/rag_agent/tools.py
+→ evaluation/run_rag.py
+→ evaluation/score.py
+```
+
+## 数据与隐私
+
+以下内容只保留在本地，不上传到 GitHub：
+
+- `project/.env` 和 API Key
+- `markdown_docs/` 原始语料
+- `qdrant_db/`、`parent_store/` 本地运行数据库
+- `evaluation/artifacts/` 测试集、真实回答和评分报告
+- 虚拟环境、模型缓存、日志和个人资料
+
+## 学习说明
+
+这个项目刻意保留了主图、Agent 子图、检索工具、reranker 和 Ragas 评测的独立文件，方便按照数据流逐层阅读。不要只看最终回答，建议同时查看 `runs_preview.md` 中的检索来源、子问题和 Agent 行为轨迹。
