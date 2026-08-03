@@ -1,4 +1,4 @@
-# Agentic RAG · 中文文档智能问答系统
+# 多轮 Agentic RAG 企业文档智能问答系统
 
 完整的项目结构、运行步骤、源码职责和 Ragas 评测流程见 [RAG_SYSTEM_GUIDE.md](./RAG_SYSTEM_GUIDE.md)。
 
