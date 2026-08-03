@@ -37,21 +37,47 @@
 ## 架构概览
 
 ```mermaid
-flowchart LR
-    Q[用户问题] --> M[主图]
-    M --> R[改写问题]
-    R --> A1[Agent 子图 1]
-    R --> A2[Agent 子图 2]
-    R --> AN[Agent 子图 N]
-    A1 --> S[混合召回]
-    A2 --> S
-    AN --> S
-    S --> RR[Cross-Encoder 精排]
-    RR --> P[父块回取]
-    P --> D{继续检索?}
-    D -->|是| S
-    D -->|否| F[子问题答案]
-    F --> G[汇总最终回答]
+flowchart TB
+    Q([用户问题]) --> M
+
+    subgraph MAIN[主图 · 对话编排]
+        direction LR
+        M[多轮记忆] --> R[问题改写]
+        R --> C{问题清晰?}
+        C -->|否| H[澄清追问]
+        H -. 补充信息 .-> R
+        C -->|是| F[并行分发 1~3 个子问题]
+    end
+
+    F --> A
+
+    subgraph AGENT[Agent 子图 · 每个子问题独立执行]
+        direction TB
+        A[思考并选择工具] --> S[混合召回<br/>Dense + BM25 + RRF]
+        S --> RR[Cross-Encoder 精排]
+        RR --> P[按 parent_id 回取父块]
+        P --> D{信息足够?}
+        D -->|继续检索| A
+        D -->|可以作答| SA[生成子问题答案]
+    end
+
+    SA --> G[汇总并生成最终回答]
+    G --> O([返回用户])
+
+    classDef input fill:#F8FAFC,stroke:#475569,color:#0F172A,stroke-width:1.5px;
+    classDef main fill:#EFF6FF,stroke:#3B82F6,color:#1E3A8A,stroke-width:1.5px;
+    classDef agent fill:#ECFDF5,stroke:#10B981,color:#064E3B,stroke-width:1.5px;
+    classDef decision fill:#FFF7ED,stroke:#F59E0B,color:#7C2D12,stroke-width:1.5px;
+    classDef answer fill:#F5F3FF,stroke:#8B5CF6,color:#4C1D95,stroke-width:1.5px;
+
+    class Q,O input;
+    class M,R,H,F main;
+    class A,S,RR,P agent;
+    class C,D decision;
+    class SA,G answer;
+
+    style MAIN fill:#F8FBFF,stroke:#93C5FD,stroke-width:1px
+    style AGENT fill:#F6FFFB,stroke:#6EE7B7,stroke-width:1px
 ```
 
 ### 检索链路
