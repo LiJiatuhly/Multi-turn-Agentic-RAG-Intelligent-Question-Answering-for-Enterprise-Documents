@@ -1,5 +1,7 @@
 # Agentic RAG · 中文文档智能问答系统
 
+完整的项目结构、运行步骤、源码职责和 Ragas 评测流程见 [RAG_SYSTEM_GUIDE.md](./RAG_SYSTEM_GUIDE.md)。
+
 基于 **LangGraph** 手写「主图 + Agent 子图」双层状态图的多轮 Agentic RAG 系统。模型自主决定检索轮次与检索粒度，支持复合问题并行拆解、澄清追问、上下文压缩与预算护栏。
 
 > 不依赖 `create_react_agent` 等 prebuilt 封装，两张图完全手写，便于精细控制 Agent 的检索循环、上下文工程与容错逻辑。
@@ -153,20 +155,13 @@ flowchart TD
 
 ```
 agentic-rag-cn/
-├── project/                  # 核心代码
-│   ├── graph.py              # 总装：注册节点、连边、compile 两张图
-│   ├── graph_state.py        # 状态模板 State / AgentState + 3 个 reducer
-│   ├── nodes.py              # 所有节点的业务逻辑（主图 + 子图）
-│   ├── edges.py              # 两个条件边（路由决策）
-│   ├── tools.py              # 2 个检索工具（搜子块 / 取父块）
-│   ├── schemas.py            # 结构化输出的数据模型（Pydantic）
-│   └── prompts.py            # 系统提示词
-├── markdown_docs/            # 待入库的示例文档
-├── 图示/                     # 架构图 / 截图
-├── 数据流转对照表.md          # 字段级数据流转文档（配合三张图看）
-├── 运行与自检指南.md          # 运行步骤与自检清单
-├── check_syntax.py           # 语法自检脚本
-├── requirements.txt          # 依赖
+├── project/                  # 核心代码（详见 RAG_SYSTEM_GUIDE.md）
+├── markdown_docs/            # Markdown 语料
+├── parent_store/             # 父块运行数据
+├── qdrant_db/                # 本地 Qdrant 运行数据
+├── evaluation/               # Ragas 评测脚本
+├── RAG_SYSTEM_GUIDE.md       # 完整运行和源码说明书
+├── requirements.txt          # 项目依赖
 └── LICENSE                   # MIT
 ```
 
@@ -187,7 +182,9 @@ pip install -r requirements.txt
 在项目根目录创建 `.env`（或按 `config.py` 的约定配置）：
 
 ```bash
-ZHIPUAI_API_KEY=你的智谱API Key
+API_KEY=你的智谱API Key
+BASE_URL=https://open.bigmodel.cn/api/paas/v4/
+MODEL_ID=glm-4.7
 ```
 
 ### 3. 文档入库
@@ -198,7 +195,7 @@ ZHIPUAI_API_KEY=你的智谱API Key
 
 启动 Gradio 界面后，在浏览器打开 `http://127.0.0.1:7860` 开始多轮问答。
 
-> 详细运行步骤与自检清单见 [`运行与自检指南.md`](./运行与自检指南.md)。
+> 详细运行步骤、源码职责和评测流程见 [`RAG_SYSTEM_GUIDE.md`](./RAG_SYSTEM_GUIDE.md)。
 
 ---
 
@@ -206,8 +203,9 @@ ZHIPUAI_API_KEY=你的智谱API Key
 
 ```
 用户问题
-  → search_child_chunks：稠密 + BM25 双路召回子块，RRF 融合，阈值过滤
-  → 命中子块带 parent_id
+  → search_child_chunks：稠密 + BM25 双路召回候选子块，RRF 融合，阈值过滤
+  → jina multilingual cross-encoder：对候选子块按“问题-原文”相关性重排
+  → 保留 top-k 子块，命中结果带 parent_id
   → retrieve_parent_chunks：按 parent_id 回取完整父块，补全上下文
   → 模型基于父块作答
 ```
@@ -215,6 +213,7 @@ ZHIPUAI_API_KEY=你的智谱API Key
 - **子块**：小片段，入 Qdrant，保证向量匹配精度
 - **父块**：大段原文，独立存储，避免大文本挤占向量库
 - **混合检索**：稠密向量抓语义相似、BM25 抓关键词精确匹配，RRF 融合两路排名
+- **二阶段检索**：先用向量库召回 20 个候选，再用 reranker 精排后交给 Agent，最终仍只返回 7 个子块
 
 ---
 

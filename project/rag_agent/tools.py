@@ -47,6 +47,7 @@ import config
 # 向量库里存的是切碎的【子块】(小片段，利于精确匹配)；完整的【父块】(大段原文)另存一处。
 # ParentStoreManager 就负责"给我一个 parent_id，我把对应的整段父块内容捞出来"。
 from db.parent_store_manager import ParentStoreManager
+from .reranker import ChunkReranker
 # 三个 log_* 是日志函数(在 core/execution_logger.py)：只负责打印调试信息，
 # 不影响检索逻辑本身。看代码时可以直接忽略它们，把注意力放在 try 里的检索动作。
 from core.execution_logger import log_error, log_tool_end, log_tool_start
@@ -65,6 +66,7 @@ class ToolFactory:
         # collection：向量库集合对象，运行时由外部传入。它提供 similarity_search 方法(下面用)。
         self.collection = collection                      # 向量库集合（用于搜子块）
         self.parent_store_manager = ParentStoreManager()  # 父块存储（用于取大块）
+        self.reranker = ChunkReranker(config.RERANKER_MODEL)
 
     def _search_child_chunks(self, query: str, limit: int = config.DEFAULT_RETRIEVAL_K) -> str:
         """在文档中搜索与用户问题相关的片段（子块）。
@@ -87,9 +89,11 @@ class ToolFactory:
             #   k=limit         → 最多返回几个(取最相近的 k 个)
             #   score_threshold → 相似度门槛(低于这个分数的太不相关，直接丢弃)，来自 config
             # 返回：一个"文档对象列表"，每个 doc 有 .page_content(正文) 和 .metadata(元数据字典)。
+            final_limit = min(max(1, limit), config.DEFAULT_RETRIEVAL_K)
+            candidate_limit = max(final_limit, config.RETRIEVAL_CANDIDATE_K)
             results = self.collection.similarity_search(
                 query,
-                k=limit,
+                k=candidate_limit,
                 score_threshold=config.RETRIEVAL_SCORE_THRESHOLD,
             )
             # if：一个都没搜到 → 返回"没相关内容"的暗号（供 nodes._retrieval_contexts 过滤掉）
@@ -97,6 +101,14 @@ class ToolFactory:
                 output = "NO_RELEVANT_CHUNKS"  # 没搜到相关内容的标记
                 log_tool_end("search_child_chunks", output)
                 return output
+
+            # 第一阶段是混合召回，第二阶段用 cross-encoder 精排后只保留 top-k。
+            try:
+                results = self.reranker.rerank(query, results, final_limit)
+            except Exception as e:
+                # 模型首次下载或本地推理失败时，保留原有召回结果，避免整个 Agent 中断。
+                log_error("reranker", e)
+                results = results[:final_limit]
 
             # ── 把每个命中的子块拼成固定格式的文本返回给模型 ──────────────────
             # ⭐ 这里的格式("Parent ID:…\nFile Name:…\nContent:…" + CHILD_CHUNK_SEPARATOR 分隔)

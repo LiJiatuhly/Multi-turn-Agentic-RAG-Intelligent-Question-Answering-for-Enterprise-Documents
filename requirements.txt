@@ -24,3 +24,4 @@ python-dotenv==1.2.2
 # - 已改用智谱 embedding，所以【不再需要】sentence-transformers / langchain-huggingface / torch，
 #   安装体积和时间大幅减小。
 # - langfuse / ragas / matplotlib / seaborn / ipykernel 这些只在教学notebook里用，运行本项目不需要。
+# - Ragas 使用独立环境，版本见 evaluation/requirements-eval.txt。

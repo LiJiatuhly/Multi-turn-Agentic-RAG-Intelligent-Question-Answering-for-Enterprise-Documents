@@ -35,6 +35,8 @@ from config import (
     CHILD_CHUNK_SEPARATOR,      # 分隔多个子块结果的分隔符
     MAIN_HISTORY_MESSAGES_TO_KEEP,  # 主图保留多少条近期消息
     TOKEN_GROWTH_FACTOR,        # 压缩摘要允许增长的比例
+    MAX_ITERATIONS,
+    MAX_TOOL_CALLS,
 )
 
 # 启动时就检查配置合法性，而不是等到运行时才发现
@@ -1228,6 +1230,14 @@ def collect_answer(state: AgentState):
             # 🔢 空态：整轮一次都没搜到有效原文（或工具全返回暗号被过滤掉）→ []
             #    用 .get(..., []) 而不是 [...]：字段可能压根没被写过（一次工具都没调），直接取会 KeyError。
             "contexts": state.get("retrieved_contexts", []),
+
+            # Evaluation trace metadata. These fields only describe how the
+            # sub-agent reached its answer; they are not fed back to the LLM.
+            "iteration_count": state.get("iteration_count", 0),
+            "tool_call_count": state.get("tool_call_count", 0),
+            "retrieval_keys": sorted(state.get("retrieval_keys", set())),
+            "used_fallback": state.get("iteration_count", 0) >= MAX_ITERATIONS
+                or state.get("tool_call_count", 0) >= MAX_TOOL_CALLS,
         }]
     }
     # 之后子图走向 END（见 graph.py：collect_answer → END），

@@ -45,6 +45,10 @@ LLM_SEED = 42
 # 如果你发现检索经常为空，可以把它再调低甚至设为 0。
 RETRIEVAL_SCORE_THRESHOLD = 0.02
 DEFAULT_RETRIEVAL_K = 7
+RETRIEVAL_CANDIDATE_K = 20       # 先召回更多候选，再交给 reranker 精排
+RERANKER_MODEL = os.environ.get(
+    "RERANKER_MODEL", "jinaai/jina-reranker-v2-base-multilingual"
+)
 CHILD_CHUNK_SEPARATOR = "\n\n<CHILD_CHUNK_BOUNDARY>\n\n"
 
 # --- Agent 预算配置（防止死循环）---
